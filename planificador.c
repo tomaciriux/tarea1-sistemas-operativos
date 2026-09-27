@@ -268,6 +268,42 @@ static int cargar_plan(const char *nombre_archivo) {
     return cantidad > 0 ? 0 : -1;
 }
 
+static int hay_ciclo(void) {
+    int *pendientes = malloc(cantidad * sizeof(int));
+    int *cola = malloc(cantidad * sizeof(int));
+    if (pendientes == NULL || cola == NULL) {
+        free(pendientes);
+        free(cola);
+        return 1;
+    }
+
+    for (int i = 0; i < cantidad; i++) {
+        pendientes[i] = actividades[i].pendientes;
+    }
+
+    int inicio = 0, fin = 0, procesadas = 0;
+    for (int i = 0; i < cantidad; i++) {
+        if (pendientes[i] == 0)
+            cola[fin++] = i;
+    }
+
+    while (inicio < fin) {
+        int actual = cola[inicio++];
+        procesadas++;
+
+        for (int j = 0; j < actividades[actual].cantidad_dependientes; j++) {
+            int siguiente = actividades[actual].dependientes[j];
+            pendientes[siguiente]--;
+            if (pendientes[siguiente] == 0)
+                cola[fin++] = siguiente;
+        }
+    }
+
+    free(pendientes);
+    free(cola);
+    return procesadas != cantidad;
+}
+
 int main(int argc, char *argv[]) {
     if (argc != 3) {
         fprintf(stderr, "Uso: %s plan.txt K\n", argv[0]);
@@ -279,7 +315,12 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    printf("Plan cargado correctamente. Total actividades: %d\n", cantidad);
+    if (hay_ciclo()) {
+        fprintf(stderr, "El plan contiene un ciclo invalido.\n");
+        return 1;
+    }
+
+    printf("Plan cargado y validado como DAG sin ciclos. Total actividades: %d\n", cantidad);
 
     for (int i = 0; i < cantidad; i++) {
         free(actividades[i].dependencias);
