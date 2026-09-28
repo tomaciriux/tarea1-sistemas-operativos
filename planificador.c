@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <errno.h>
 
 #define MAX_ID 32
@@ -34,6 +36,12 @@ typedef struct {
     Estado estado;
     pid_t pid;
 } Actividad;
+
+typedef struct {
+    int actividad;
+    pid_t pid;
+    int pipe_lectura;
+} Proceso;
 
 static Actividad *actividades = NULL;
 static int cantidad = 0;
@@ -304,11 +312,73 @@ static int hay_ciclo(void) {
     return procesadas != cantidad;
 }
 
+static void ejecutar_hijo(Actividad *a, int fd) {
+    struct timespec espera;
+    espera.tv_sec = a->tiempo / 1000;
+    espera.tv_nsec = (a->tiempo % 1000) * 1000000L;
+
+    while (nanosleep(&espera, &espera) == -1 && errno == EINTR)
+        ;
+
+    char mensaje[MAX_MENSAJE];
+    snprintf(mensaje, sizeof(mensaje), "OK:%s", a->id);
+    write(fd, mensaje, strlen(mensaje) + 1);
+    close(fd);
+    _exit(0);
+}
+
+static int iniciar_actividad(int idx, Proceso *procesos, int max_procesos, int *ejecutando) {
+    int fd[2];
+    if (pipe(fd) == -1) {
+        perror("pipe");
+        return -1;
+    }
+
+    pid_t pid = fork();
+    if (pid == -1) {
+        perror("fork");
+        close(fd[0]);
+        close(fd[1]);
+        return -1;
+    }
+
+    if (pid == 0) {
+        close(fd[0]);
+        ejecutar_hijo(&actividades[idx], fd[1]);
+    }
+
+    close(fd[1]);
+
+    for (int i = 0; i < max_procesos; i++) {
+        if (procesos[i].actividad == -1) {
+            procesos[i].actividad = idx;
+            procesos[i].pid = pid;
+            procesos[i].pipe_lectura = fd[0];
+            break;
+        }
+    }
+
+    actividades[idx].pid = pid;
+    actividades[idx].estado = CORRIENDO;
+    (*ejecutando)++;
+    return 0;
+}
+
 int main(int argc, char *argv[]) {
     if (argc != 3) {
         fprintf(stderr, "Uso: %s plan.txt K\n", argv[0]);
         return 1;
     }
+
+    char *fin;
+    long k_largo = strtol(argv[2], &fin, 10);
+    if (*fin != '\0' || k_largo <= 0) {
+        fprintf(stderr, "K debe ser un entero positivo.\n");
+        return 1;
+    }
+
+    int K = (int)k_largo;
+    srand((unsigned)time(NULL));
 
     if (cargar_plan(argv[1]) != 0) {
         fprintf(stderr, "No se pudo cargar el plan.\n");
@@ -316,17 +386,84 @@ int main(int argc, char *argv[]) {
     }
 
     if (hay_ciclo()) {
-        fprintf(stderr, "El plan contiene un ciclo invalido.\n");
+        fprintf(stderr, "El plan contiene un ciclo.\n");
         return 1;
     }
 
-    printf("Plan cargado y validado como DAG sin ciclos. Total actividades: %d\n", cantidad);
+    int *cola = malloc(cantidad * sizeof(int));
+    Proceso *procesos = malloc(K * sizeof(Proceso));
+
+    if (cola == NULL || procesos == NULL) {
+        fprintf(stderr, "No hay memoria suficiente.\n");
+        return 1;
+    }
+
+    for (int i = 0; i < K; i++)
+        procesos[i].actividad = -1;
+
+    int primero = 0, ultimo = 0;
+    for (int i = 0; i < cantidad; i++) {
+        if (actividades[i].pendientes == 0) {
+            actividades[i].estado = LISTA;
+            cola[ultimo++] = i;
+        }
+    }
+
+    int ejecutando = 0;
+    int terminadas = 0;
+
+    printf("Planificador iniciado con paso de mensajes por pipes (K = %d)...\n", K);
+
+    while (terminadas < cantidad) {
+        while (ejecutando < K && primero < ultimo) {
+            int idx = cola[primero++];
+            iniciar_actividad(idx, procesos, K, &ejecutando);
+        }
+
+        int status;
+        pid_t terminado_pid = wait(&status);
+        if (terminado_pid <= 0)
+            break;
+
+        for (int i = 0; i < K; i++) {
+            if (procesos[i].pid == terminado_pid) {
+                char mensaje[MAX_MENSAJE] = {0};
+                read(procesos[i].pipe_lectura, mensaje, sizeof(mensaje) - 1);
+                close(procesos[i].pipe_lectura);
+
+                int idx = procesos[i].actividad;
+                actividades[idx].estado = TERMINADA;
+                terminadas++;
+                ejecutando--;
+                procesos[i].actividad = -1;
+
+                printf("Actividad [%s] termino y envio insumo: %s\n", actividades[idx].nombre, mensaje);
+
+                for (int j = 0; j < actividades[idx].cantidad_dependientes; j++) {
+                    int siguiente = actividades[idx].dependientes[j];
+                    if (actividades[siguiente].estado == PENDIENTE) {
+                        actividades[siguiente].pendientes--;
+                        if (actividades[siguiente].pendientes == 0) {
+                            actividades[siguiente].estado = LISTA;
+                            cola[ultimo++] = siguiente;
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    printf("Planificacion completada exitosamente.\n");
 
     for (int i = 0; i < cantidad; i++) {
         free(actividades[i].dependencias);
         free(actividades[i].dependientes);
     }
+
     free(actividades);
+    free(cola);
+    free(procesos);
 
     return 0;
 }
